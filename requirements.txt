@@ -1,0 +1,9 @@
+crewai
+streamlit
+python-dotenv
+nba_api
+anthropic
+tavily-python
+langchain-community
+duckduckgo-search
+
