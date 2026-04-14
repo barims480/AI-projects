@@ -1,0 +1,224 @@
+import os
+import time
+import streamlit as st
+from dotenv import load_dotenv
+from pathlib import Path
+from crewai import Agent, Task, Crew, Process, LLM
+from crewai.tools import tool
+from crewai_tools import TavilySearchTool
+from langchain_community.tools import DuckDuckGoSearchRun
+from nba_api.stats.static import players
+from nba_api.stats.endpoints import leaguegamefinder
+
+
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+
+
+st.set_page_config(
+    page_title="NBA Betting AI",
+    page_icon="🏀",
+    layout="centered"
+)
+
+st.title("🏀 NBA Betting AI")
+st.caption("for personal use only.")
+
+
+with st.sidebar:
+    st.header("📋 Bet Details")
+
+    game = st.text_input("Game", placeholder="e.g. L.A. Lakers vs Houston Rockets")
+    player = st.text_input("Player", placeholder="e.g. Kevin Durant")
+    opponent = st.text_input("Opponent Team", placeholder="e.g. L.A. Lakers")
+    opponent_abbr = st.text_input("Opponent Abbreviation", placeholder="e.g. LAL")
+    bet_line = st.text_input("Bet Line", placeholder="e.g. 26.5 Points")
+
+    run_button = st.button("🔍 Analyze", use_container_width=True, type="primary")
+
+    st.divider()
+    st.caption("💡 Tip: Use standard NBA abbreviations like LAL, HOU, GSW, BOS")
+
+
+@tool("duckduckgo_search")
+def wrapped_ddg_search(query: str):
+    """Useful for searching the internet for current NBA news and injury reports."""
+    search = DuckDuckGoSearchRun()
+    return search.run(query)
+
+tavily_tool = TavilySearchTool()
+
+@tool("nba_game_finder")
+def nba_game_finder(player_name: str, opponent_abbreviation: str = ""):
+    """
+    Fetches last 10 game logs for an NBA player, optionally filtered by opponent.
+    Use standard NBA team abbreviations e.g. 'LAL' for Lakers, 'HOU' for Rockets.
+    """
+    try:
+        nba_players = players.find_players_by_full_name(player_name)
+        if not nba_players:
+            return f"No player found: {player_name}"
+        player_id = nba_players[0]['id']
+        time.sleep(1)
+        game_research = leaguegamefinder.LeagueGameFinder(player_id_nullable=player_id)
+        games = game_research.get_data_frames()[0]
+        if opponent_abbreviation:
+            games = games[games['MATCHUP'].str.contains(opponent_abbreviation)]
+        return games.head(10)[['GAME_DATE', 'MATCHUP', 'PTS', 'MIN', 'REB', 'AST', 'WL']].to_string()
+    except Exception as e:
+        return f"NBA API error: {str(e)}"
+
+
+def run_analysis(game, player, opponent, opponent_abbr, bet_line):
+    claude_llm = LLM(model="anthropic/claude-sonnet-4-6", temperature=0.2)
+
+    reporter = Agent(
+        role='NBA Data Researcher',
+        goal=f'Find the latest injury reports and team form for {game}',
+        backstory="You are a veteran sports analyst focused on real-time status updates.",
+        tools=[tavily_tool, wrapped_ddg_search],
+        llm=claude_llm,
+        verbose=False
+    )
+
+    trend_analyst = Agent(
+        role="NBA Trend Analyst",
+        goal=f"Analyze performance trends for {player} against {opponent}",
+        backstory="You are a mathematical analyst using game logs to find betting edges.",
+        tools=[nba_game_finder, wrapped_ddg_search],
+        llm=claude_llm,
+        verbose=False,
+        allow_delegation=False
+    )
+
+    strategist = Agent(
+        role="Betting Strategist",
+        goal=f"Synthesize research into a final bet recommendation on {bet_line}",
+        backstory=(
+            "You are a sharp sports bettor who synthesizes research into clear +EV bet "
+            "recommendations. You weigh injury context, recent form, and head-to-head "
+            "history to produce a confident, well-reasoned final call."
+        ),
+        llm=claude_llm,
+        verbose=False,
+        allow_delegation=False
+    )
+
+    task_report = Task(
+        description=(
+            f"Research the current injury and health status for {player} and the full "
+            f"{game} matchup. Include any relevant teammate injuries that could affect "
+            f"{player}'s role or usage."
+        ),
+        expected_output=f"A clear summary of player health and team-wide injury context for {game}.",
+        agent=reporter
+    )
+
+    task_trend = Task(
+        description=(
+            f"Analyze {player}'s performance history against {opponent} and their last 4 "
+            f"games head-to-head. Use the nba_game_finder tool with opponent abbreviation "
+            f"'{opponent_abbr}'. Look for scoring trends, minutes trends, and matchup-specific patterns."
+        ),
+        expected_output=(
+            f"A data-driven report on {player}'s recent form and head-to-head history vs "
+            f"{opponent}, with an initial view on whether the {bet_line} line looks "
+            f"undervalued or overvalued."
+        ),
+        agent=trend_analyst
+    )
+
+    task_strategy = Task(
+        description=(
+            f"Using the injury report and trend analysis, make a final recommendation on "
+            f"{player}'s {bet_line} prop bet for the {game} game. "
+            f"State clearly: OVER or UNDER, a confidence score from 1-10, and your key reasoning."
+        ),
+        expected_output=(
+            f"Final recommendation: OVER or UNDER {bet_line} | Confidence: X/10 | "
+            f"Key reasons: [3 bullet points max]"
+        ),
+        agent=strategist,
+        context=[task_report, task_trend]
+    )
+
+    crew = Crew(
+        agents=[reporter, trend_analyst, strategist],
+        tasks=[task_report, task_trend, task_strategy],
+        process=Process.sequential,
+        verbose=False
+    )
+
+    return crew.kickoff(inputs={
+        'game': game,
+        'player': player,
+        'opponent': opponent,
+        'bet_line': bet_line
+    })
+
+# ── Main UI ───────────────────────────────────────────────────────────────────
+if run_button:
+    if not all([game, player, opponent, bet_line]):
+        st.error("Please fill in all fields before analyzing.")
+    else:
+        st.divider()
+        progress = st.progress(0, text="Starting analysis...")
+        status = st.empty()
+
+        with st.spinner(""):
+            status.info("🔍 Agent 1/3 — Researching injuries and team news...")
+            progress.progress(15)
+            time.sleep(0.5)
+
+            status.info("📊 Agent 2/3 — Analyzing player trends and head-to-head data...")
+            progress.progress(50)
+
+            try:
+                result = run_analysis(game, player, opponent, opponent_abbr, bet_line)
+                progress.progress(90)
+
+                status.info("🧠 Agent 3/3 — Generating final recommendation...")
+                time.sleep(0.5)
+                progress.progress(100)
+                status.empty()
+                progress.empty()
+
+                st.success("✅ Analysis complete!")
+                st.divider()
+
+                st.subheader(f"📌 {player} — {bet_line}")
+                st.caption(f"{game}")
+
+                result_str = str(result)
+
+                if "OVER" in result_str.upper():
+                    st.metric("Recommendation", "⬆️ OVER", delta="Lean Over")
+                elif "UNDER" in result_str.upper():
+                    st.metric("Recommendation", "⬇️ UNDER", delta="Lean Under")
+
+                st.divider()
+                st.markdown("### 📝 Full Analysis")
+                st.markdown(result_str)
+
+                if "history" not in st.session_state:
+                    st.session_state.history = []
+                st.session_state.history.append({
+                    "game": game,
+                    "player": player,
+                    "bet_line": bet_line,
+                    "result": result_str
+                })
+
+            except Exception as e:
+                progress.empty()
+                status.empty()
+                st.error(f"❌ Analysis failed: {str(e)}")
+
+# ── History ───────────────────────────────────────────────────────────────────
+if "history" in st.session_state and st.session_state.history:
+    st.divider()
+    with st.expander(f"📂 Previous Analyses ({len(st.session_state.history)})"):
+        for i, item in enumerate(reversed(st.session_state.history)):
+            st.markdown(f"**{item['player']} — {item['bet_line']}** | {item['game']}")
+            st.caption(item['result'][:300] + "..." if len(item['result']) > 300 else item['result'])
+            if i < len(st.session_state.history) - 1:
+                st.divider()
